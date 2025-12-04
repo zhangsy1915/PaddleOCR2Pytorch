@@ -8,7 +8,8 @@
 1. [整体架构概述](#1-整体架构概述)
 2. [检测模型 (DBNet) 详解](#2-检测模型-dbnet-详解)
 3. [识别模型 (CRNN) 详解](#3-识别模型-crnn-详解)
-4. [PyTorch 最佳实践高亮](#4-pytorch-最佳实践高亮)
+4. [PP-OCRv5 架构详解](#4-pp-ocrv5-架构详解) 🆕
+5. [PyTorch 最佳实践高亮](#5-pytorch-最佳实践高亮)
 
 ---
 
@@ -517,9 +518,452 @@ class CTCHead(nn.Module):
 
 ---
 
-## 4. PyTorch 最佳实践高亮
+## 4. PP-OCRv5 架构详解 🆕
 
-### 4.1 ✅ 优雅写法示例
+PP-OCRv5 是 PaddleOCR 系列的最新版本，相比之前版本有显著提升：
+- 🌐 单模型支持**五种**文字类型（简体中文、繁体中文、中文拼音、英文和日文）
+- ✍️ 支持复杂**手写体**识别
+- 🎯 相比 PP-OCRv4，识别精度**提升13个百分点**
+
+PP-OCRv5 提供 **Mobile** 和 **Server** 两个版本，分别针对移动端和服务器端场景优化。
+
+### 4.1 PP-OCRv5 检测模型
+
+#### 4.1.1 Mobile 版检测架构
+
+```yaml
+# configs/det/PP-OCRv5/PP-OCRv5_mobile_det.yml
+Architecture:
+  model_type: det
+  algorithm: DB
+  Backbone:
+    name: PPLCNetV3
+    scale: 0.75
+    det: True
+  Neck:
+    name: RSEFPN
+    out_channels: 96
+    shortcut: True
+  Head:
+    name: DBHead
+    k: 50
+```
+
+**核心组件**：
+- **Backbone**: PPLCNetV3 - 新一代轻量级主干网络
+- **Neck**: RSEFPN - 带 SE 注意力的特征金字塔
+- **Head**: DBHead - 可微分二值化检测头
+
+#### 4.1.2 Server 版检测架构
+
+```yaml
+# configs/det/PP-OCRv5/PP-OCRv5_server_det.yml
+Architecture:
+  model_type: det
+  algorithm: DB
+  Backbone:
+    name: PPHGNetV2_B4
+    det: True
+  Neck:
+    name: LKPAN
+    out_channels: 256
+    intracl: true
+  Head:
+    name: PFHeadLocal
+    k: 50
+    mode: "large"
+```
+
+**核心组件**：
+- **Backbone**: PPHGNetV2_B4 - 高性能 HGNet 主干网络
+- **Neck**: LKPAN - 带大卷积核的路径聚合网络
+- **Head**: PFHeadLocal - 增强版检测头
+
+#### 4.1.3 PPLCNetV3 Backbone 详解
+
+PPLCNetV3 是专为 OCR 任务设计的轻量级骨干网络，核心创新包括：
+
+```python
+# 文件: pytorchocr/modeling/backbones/rec_lcnetv3.py
+
+class LCNetV3Block(nn.Module):
+    """核心构建块：深度可分离卷积 + 可学习仿射变换"""
+    def __init__(self, in_channels, out_channels, stride, dw_size, use_se=False, ...):
+        self.dw_conv = LearnableRepLayer(...)    # 深度卷积 + 可重参数化
+        if use_se:
+            self.se = SELayer(in_channels)       # SE 注意力
+        self.pw_conv = LearnableRepLayer(...)    # 逐点卷积
+
+    def forward(self, x):
+        x = self.dw_conv(x)
+        if self.use_se:
+            x = self.se(x)
+        x = self.pw_conv(x)
+        return x
+```
+
+**🎯 关键设计 - LearnableRepLayer（可学习重参数化层）**：
+
+```python
+class LearnableRepLayer(nn.Module):
+    """训练时多分支，推理时融合为单卷积"""
+    def forward(self, x):
+        if self.is_repped:
+            # 推理时：单个重参数化卷积
+            return self.lab(self.reparam_conv(x))
+        
+        # 训练时：多分支并行
+        out = 0
+        if self.identity is not None:
+            out += self.identity(x)        # 恒等映射分支
+        if self.conv_1x1 is not None:
+            out += self.conv_1x1(x)        # 1x1 卷积分支
+        for conv in self.conv_kxk:
+            out += conv(x)                 # KxK 卷积分支
+        
+        out = self.lab(out)                # 可学习仿射变换
+        return self.act(out)
+```
+
+**📊 PPLCNetV3 检测模型张量流（scale=0.75）**：
+
+```
+输入: [B, 3, 640, 640]
+      │
+      ▼ conv1 (stride=2)
+[B, 12, 320, 320]
+      │
+      ▼ blocks2
+[B, 24, 320, 320]
+      │
+      ▼ blocks3 (stride=2)
+[B, 48, 160, 160]   ──→ out_list[0]
+      │
+      ▼ blocks4 (stride=2)
+[B, 96, 80, 80]     ──→ out_list[1]
+      │
+      ▼ blocks5 (stride=2)
+[B, 192, 40, 40]    ──→ out_list[2]
+      │
+      ▼ blocks6 (stride=2)
+[B, 384, 20, 20]    ──→ out_list[3]
+
+输出: 4个尺度特征图 [c2, c3, c4, c5]
+```
+
+#### 4.1.4 PPHGNetV2_B4 Backbone 详解
+
+PPHGNetV2 是高性能版本的主干网络，采用独特的 **HG (HardGate)** 结构：
+
+```python
+# 文件: pytorchocr/modeling/backbones/rec_pphgnetv2.py
+
+class HGV2_Block(TheseusLayer):
+    """HGV2 核心块：密集连接 + 特征聚合"""
+    def forward(self, x):
+        identity = x
+        output = [x]
+        
+        # 密集连接：每层接收所有前层的输出
+        for layer in self.layers:
+            x = layer(x)
+            output.append(x)
+        
+        # 特征聚合：拼接 + 压缩
+        x = torch.cat(output, dim=1)
+        x = self.aggregation_squeeze_conv(x)
+        x = self.aggregation_excitation_conv(x)
+        
+        # 残差连接
+        if self.identity:
+            x += identity
+        return x
+```
+
+**📊 PPHGNetV2_B4 检测模型张量流**：
+
+```
+输入: [B, 3, 640, 640]
+      │
+      ▼ StemBlock (特殊设计的stem)
+[B, 48, 160, 160]
+      │
+      ▼ Stage1 (HGV2_Stage)
+[B, 128, 160, 160]  ──→ out[0]
+      │
+      ▼ Stage2 (stride=2)
+[B, 512, 80, 80]    ──→ out[1]
+      │
+      ▼ Stage3 (stride=2)
+[B, 1024, 40, 40]   ──→ out[2]
+      │
+      ▼ Stage4 (stride=2)
+[B, 2048, 20, 20]   ──→ out[3]
+
+输出: 4个尺度特征图
+```
+
+#### 4.1.5 RSEFPN vs LKPAN Neck 对比
+
+| 特性 | RSEFPN (Mobile) | LKPAN (Server) |
+|------|-----------------|----------------|
+| SE 注意力 | ✅ 每层都有 | ✅ 可选 IntraCL |
+| 卷积核大小 | 3x3 | 9x9 (大卷积核) |
+| 参数量 | 较少 | 较多 |
+| 适用场景 | 移动端/边缘设备 | 服务器/高精度需求 |
+
+```python
+# RSEFPN: 带 SE 的轻量级 FPN
+class RSELayer(nn.Module):
+    def forward(self, ins):
+        x = self.in_conv(ins)
+        if self.shortcut:
+            out = x + self.se_block(x)  # SE 残差
+        return out
+
+# LKPAN: 大卷积核路径聚合网络
+# 使用 9x9 大卷积核增大感受野
+self.inp_conv.append(
+    p_layer(
+        in_channels=self.out_channels,
+        out_channels=self.out_channels // 4,
+        kernel_size=9,  # 大卷积核
+        padding=4,
+        bias=False))
+```
+
+### 4.2 PP-OCRv5 识别模型
+
+#### 4.2.1 Mobile 版识别架构
+
+```yaml
+# configs/rec/PP-OCRv5/PP-OCRv5_mobile_rec.yml
+Architecture:
+  model_type: rec
+  algorithm: SVTR_LCNet
+  Backbone:
+    name: PPLCNetV3
+    scale: 0.95
+  Head:
+    name: MultiHead
+    head_list:
+      - CTCHead:
+          Neck:
+            name: svtr
+            dims: 120
+            depth: 2
+            hidden_dims: 120
+          Head:
+            fc_decay: 0.00001
+      - NRTRHead:
+          nrtr_dim: 384
+          max_text_length: 25
+```
+
+#### 4.2.2 Server 版识别架构
+
+```yaml
+# configs/rec/PP-OCRv5/PP-OCRv5_server_rec.yml
+Architecture:
+  model_type: rec
+  algorithm: SVTR_HGNet
+  Backbone:
+    name: PPHGNetV2_B4
+    text_rec: True
+  Head:
+    name: MultiHead
+    head_list:
+      - CTCHead:
+          Neck:
+            name: svtr
+            dims: 120
+            depth: 2
+      - NRTRHead:
+          nrtr_dim: 384
+```
+
+#### 4.2.3 MultiHead 多头设计详解
+
+PP-OCRv5 识别模型的**核心创新**是 **MultiHead** 结构，同时使用 CTC 和 Attention 两种解码方式：
+
+```python
+# 文件: pytorchocr/modeling/heads/rec_multi_head.py
+
+class MultiHead(nn.Module):
+    def __init__(self, in_channels, out_channels_list, **kwargs):
+        # CTC 分支：SVTR Encoder + CTC Head
+        self.encoder_reshape = Im2Seq(in_channels)
+        self.ctc_encoder = SequenceEncoder(encoder_type='svtr', ...)
+        self.ctc_head = CTCHead(...)
+        
+        # Attention 分支（可选）：NRTR Transformer Head
+        # self.gtc_head = Transformer(...)
+
+    def forward(self, x, data=None):
+        # CTC 分支
+        ctc_encoder = self.ctc_encoder(x)
+        ctc_out = self.ctc_head(ctc_encoder)
+        
+        head_out = {'ctc': ctc_out, 'res': ctc_out}
+        
+        if not self.training:
+            return ctc_out  # 推理时只用 CTC
+        
+        # 训练时同时计算 Attention 分支（用于辅助训练）
+        if self.gtc_head == 'sar':
+            sar_out = self.sar_head(x, data[1:])
+            head_out['sar'] = sar_out
+        else:
+            gtc_out = self.gtc_head(self.before_gtc(x), data[1:])
+            head_out['nrtr'] = gtc_out
+        
+        return head_out
+```
+
+**🎯 MultiHead 设计优势**：
+1. **训练时**：CTC + Attention 双分支联合训练，相互增强
+2. **推理时**：仅使用 CTC 分支，保证速度
+3. **互补性**：CTC 擅长短文本，Attention 擅长复杂文本
+
+#### 4.2.4 SVTR Encoder 详解
+
+SVTR (Scene Text Visual Representation) 是 PP-OCRv5 中引入的 Transformer 编码器：
+
+```python
+# 文件: pytorchocr/modeling/necks/rnn.py
+
+class EncoderWithSVTR(nn.Module):
+    def __init__(self, in_channels, dims=64, depth=2, hidden_dims=120, ...):
+        # 通道压缩
+        self.conv1 = ConvBNLayer(in_channels, in_channels // 8, ...)
+        self.conv2 = ConvBNLayer(in_channels // 8, hidden_dims, kernel_size=1)
+        
+        # SVTR Transformer Blocks
+        self.svtr_block = nn.ModuleList([
+            Block(dim=hidden_dims, num_heads=num_heads, mixer='Global', ...)
+            for i in range(depth)
+        ])
+        
+        # 通道恢复 + 融合
+        self.conv3 = ConvBNLayer(hidden_dims, in_channels, kernel_size=1)
+        self.conv4 = ConvBNLayer(2 * in_channels, in_channels // 8, ...)
+        self.conv1x1 = ConvBNLayer(in_channels // 8, dims, kernel_size=1)
+
+    def forward(self, x):
+        h = x  # 保存原始特征用于残差
+        
+        # 降维
+        z = self.conv1(z)
+        z = self.conv2(z)
+        
+        # Transformer 处理
+        B, C, H, W = z.shape
+        z = z.flatten(2).permute(0, 2, 1)  # [B, H*W, C]
+        for blk in self.svtr_block:
+            z = blk(z)
+        z = self.norm(z)
+        
+        # 恢复空间维度
+        z = z.reshape([-1, H, W, C]).permute(0, 3, 1, 2)
+        z = self.conv3(z)
+        
+        # 残差融合
+        z = torch.cat((h, z), dim=1)
+        z = self.conv1x1(self.conv4(z))
+        
+        return z
+```
+
+**📊 PP-OCRv5 识别模型完整张量流（Mobile 版）**：
+
+```
+输入文本行图像
+[B, 3, 48, 320]
+       │
+       ▼ PPLCNetV3 Backbone
+[B, 486, 1, 40]  # 高度压缩到 1，宽度保持
+       │
+       ▼ SVTR Encoder
+         ├─ conv1 降维
+         │  [B, 60, 1, 40]
+         ├─ conv2
+         │  [B, 120, 1, 40]
+         ├─ Transformer Blocks (depth=2)
+         │  [B, 40, 120]  (序列形式)
+         ├─ conv3 恢复通道
+         │  [B, 486, 1, 40]
+         └─ 残差融合 + conv4 + conv1x1
+            [B, 120, 1, 40]
+       │
+       ▼ Im2Seq 转换
+[B, 40, 120]     # (batch, time_steps, features)
+       │
+       ▼ CTCHead
+[B, 40, vocab_size]  # 字符概率分布
+       │
+       ▼ CTC Decode (后处理)
+"识别文本"
+```
+
+### 4.3 PP-OCRv5 vs PP-OCRv4 架构对比
+
+| 组件 | PP-OCRv4 Mobile | PP-OCRv5 Mobile | 改进点 |
+|------|-----------------|-----------------|--------|
+| 检测 Backbone | MobileNetV3 | PPLCNetV3 | 可重参数化设计 |
+| 检测 Neck | RSEFPN | RSEFPN | 保持 |
+| 识别 Backbone | MobileNetV3 | PPLCNetV3 | 更强特征提取 |
+| 识别 Neck | BiLSTM | SVTR | Transformer 增强 |
+| 识别 Head | CTCHead | MultiHead | 多头联合训练 |
+| 支持语种 | 单语种 | 5种语言 | 多语言统一模型 |
+
+### 4.4 PP-OCRv5 PyTorch 实现亮点
+
+#### (1) 可学习仿射变换 (Learnable Affine Block)
+
+```python
+class LearnableAffineBlock(nn.Module):
+    """小模型精度提升利器"""
+    def __init__(self, scale_value=1.0, bias_value=0.0):
+        self.scale = nn.Parameter(torch.Tensor([scale_value]))
+        self.bias = nn.Parameter(torch.Tensor([bias_value]))
+
+    def forward(self, x):
+        return self.scale * x + self.bias  # 可学习的缩放和偏移
+```
+
+**优势**：在不增加计算量的情况下，显著提升小模型精度。
+
+#### (2) 重参数化技术 (Re-parameterization)
+
+```python
+def rep(self):
+    """将多分支融合为单卷积，推理加速"""
+    if self.is_repped:
+        return
+    kernel, bias = self._get_kernel_bias()
+    self.reparam_conv = nn.Conv2d(...)
+    self.reparam_conv.weight.data = kernel
+    self.reparam_conv.bias.data = bias
+    self.is_repped = True
+```
+
+**原理**：训练时多分支增强表达能力，推理时融合为单卷积提升速度。
+
+#### (3) 训练/推理自适应池化
+
+```python
+# PPLCNetV3 和 PPHGNetV2 中
+if self.training:
+    x = F.adaptive_avg_pool2d(x, [1, 40])  # 训练：固定输出尺寸
+else:
+    x = F.avg_pool2d(x, [3, 2])            # 推理：动态适应输入
+```
+
+---
+
+## 5. PyTorch 最佳实践高亮
+
+### 5.1 ✅ 优雅写法示例
 
 #### (1) 使用 `nn.ModuleList` 动态构建层
 
@@ -582,7 +1026,7 @@ out4 = in4 + F.interpolate(in5, scale_factor=2, mode="nearest")
 
 **优点**：`mode="nearest"` 速度快且适合分割任务，`mode="bilinear"` 更平滑适合生成任务。
 
-### 4.2 ⚠️ 可改进之处
+### 5.2 ⚠️ 可改进之处
 
 #### (1) 字符串 `eval()` 的安全隐患
 
@@ -626,7 +1070,7 @@ def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
     ...
 ```
 
-### 4.3 🎓 值得学习的设计模式
+### 5.3 🎓 值得学习的设计模式
 
 #### (1) 残差连接 (Residual Connection)
 
@@ -671,13 +1115,15 @@ self.bottleneck_conv = nn.Conv2d(
 1. **整体架构**：Backbone → Neck → Head 的模块化设计
 2. **检测模型**：MobileNetV3 提取多尺度特征 → DBFPN 融合 → DBHead 输出文本 mask
 3. **识别模型**：MobileNetV3 压缩特征 → BiLSTM 建模时序 → CTCHead 输出字符概率
-4. **PyTorch 技巧**：权重初始化、训练/推理分支、配置驱动等
+4. **PP-OCRv5**：PPLCNetV3/PPHGNetV2 新骨干 → SVTR Transformer 编码 → MultiHead 多头解码
+5. **PyTorch 技巧**：权重初始化、训练/推理分支、可重参数化等
 
 **建议的学习路径**：
 1. 先跑通一个简单的推理脚本，观察输入输出
 2. 在关键位置添加 `print(x.shape)` 验证张量流
 3. 修改配置文件，观察模型结构变化
 4. 尝试替换某个模块，如换用 ResNet 作为 Backbone
+5. 对比 PP-OCRv4 和 PP-OCRv5 的配置差异，理解版本演进
 
 ---
 
