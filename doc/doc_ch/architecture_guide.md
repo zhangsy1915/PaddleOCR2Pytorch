@@ -851,6 +851,7 @@ class EncoderWithSVTR(nn.Module):
 
     def forward(self, x):
         h = x  # 保存原始特征用于残差
+        z = x  # 初始化 z 为输入
         
         # 降维
         z = self.conv1(z)
