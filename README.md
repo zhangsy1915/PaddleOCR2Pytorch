@@ -68,6 +68,7 @@ PaddleOCR模型百度网盘链接：https://pan.baidu.com/s/1getAprT2l_JqwhjwML0
 ## 文档教程
 - [快速安装](./doc/doc_ch/installation.md)
 - [模型预测](./doc/doc_ch/inference.md)
+- [网络架构深度解析](./doc/doc_ch/architecture_guide.md) 🆕
 - [Pipline](#Pipline)
 - [效果展示](#效果展示)
 - [参考文献](./doc/doc_ch/reference.md)
